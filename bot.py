@@ -1,28 +1,20 @@
 """
 TradeScan Bot — Señales automáticas para Pocket Option
-Indicadores: RSI, EMA 9/21, Bollinger Bands, Stochastic, MHI
-(Sin pandas-ta — cálculo manual compatible con Python 3.11+)
 """
-
 import os
 import asyncio
 import logging
 import numpy as np
 from datetime import datetime
-
 import yfinance as yf
 import pandas as pd
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── CONFIG ────────────────────────────────────────────────
 TOKEN        = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID      = os.getenv('TELEGRAM_CHAT_ID', '')
 INTERVAL_MIN = int(os.getenv('SIGNAL_INTERVAL', '5'))
@@ -40,7 +32,7 @@ ASSET_NAMES = {
     'EURJPY=X': 'EUR/JPY-OTC',
 }
 
-# ── INDICADORES MANUALES ──────────────────────────────────
+# ── INDICADORES ───────────────────────────────────────────
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(period).mean()
@@ -60,104 +52,109 @@ def calc_stoch(high, low, close, k=14, d=3):
     lowest  = low.rolling(k).min()
     highest = high.rolling(k).max()
     stoch_k = 100 * (close - lowest) / (highest - lowest).replace(0, np.nan)
-    stoch_d = stoch_k.rolling(d).mean()
-    return stoch_k, stoch_d
+    return stoch_k, stoch_k.rolling(d).mean()
+
+# ── OBTENER DATOS (con timeout) ───────────────────────────
+def fetch_data(ticker: str):
+    """Descarga datos con timeout de 15 segundos"""
+    try:
+        df = yf.download(
+            ticker, period='1d', interval='1m',
+            progress=False, auto_adjust=True,
+            timeout=15
+        )
+        if df is None or df.empty:
+            # Intentar con period='2d' como fallback
+            df = yf.download(
+                ticker, period='2d', interval='1m',
+                progress=False, auto_adjust=True,
+                timeout=15
+            )
+        return df
+    except Exception as e:
+        logger.warning(f"Error descargando {ticker}: {e}")
+        return None
 
 # ── SEÑAL ─────────────────────────────────────────────────
 def get_signal(ticker: str) -> dict | None:
     try:
-        df = yf.download(ticker, period='2d', interval='1m',
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty or len(df) < 30:
+        df = fetch_data(ticker)
+
+        if df is None or df.empty or len(df) < 20:
+            logger.warning(f"{ticker}: datos insuficientes ({len(df) if df is not None else 0} velas)")
             return None
 
+        # Aplanar multi-index
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        close = df['Close'].astype(float)
-        high  = df['High'].astype(float)
-        low   = df['Low'].astype(float)
-        open_ = df['Open'].astype(float)
+        close = df['Close'].astype(float).dropna()
+        high  = df['High'].astype(float).dropna()
+        low   = df['Low'].astype(float).dropna()
+        open_ = df['Open'].astype(float).dropna()
 
-        rsi     = float(calc_rsi(close, 14).iloc[-1])
-        ema9    = float(calc_ema(close, 9).iloc[-1])
-        ema21   = float(calc_ema(close, 21).iloc[-1])
-        bb_up, bb_mid, bb_lo = calc_bb(close, 20)
+        if len(close) < 20:
+            return None
+
+        rsi      = float(calc_rsi(close, 14).iloc[-1])
+        ema9     = float(calc_ema(close, 9).iloc[-1])
+        ema21    = float(calc_ema(close, 21).iloc[-1])
+        bb_up, _, bb_lo = calc_bb(close, 20)
         bb_upper = float(bb_up.iloc[-1])
         bb_lower = float(bb_lo.iloc[-1])
         stoch_k, _ = calc_stoch(high, low, close)
         stoch_kv = float(stoch_k.iloc[-1])
         price    = float(close.iloc[-1])
 
-        last5   = df.tail(5)
-        greens  = sum(1 for _, r in last5.iterrows()
-                      if float(r['Close']) > float(r['Open']))
-        reds    = 5 - greens
+        # Verificar NaN
+        if any(np.isnan(v) for v in [rsi, ema9, ema21, stoch_kv, price]):
+            return None
+
+        last5  = df.tail(5)
+        greens = sum(1 for _, r in last5.iterrows() if float(r['Close']) > float(r['Open']))
+        reds   = 5 - greens
         cur_candle = 'ALCISTA' if float(close.iloc[-1]) > float(open_.iloc[-1]) else 'BAJISTA'
 
-        score_call = 0
-        score_put  = 0
-        reasons    = []
+        score_call, score_put = 0, 0
+        reasons = []
 
         # RSI
-        if rsi < 25:
-            score_call += 28; reasons.append(f"RSI muy sobrevendido ({rsi:.0f})")
-        elif rsi < 35:
-            score_call += 18; reasons.append(f"RSI sobrevendido ({rsi:.0f})")
-        elif rsi < 45:
-            score_call += 8
-        elif rsi > 75:
-            score_put  += 28; reasons.append(f"RSI muy sobrecomprado ({rsi:.0f})")
-        elif rsi > 65:
-            score_put  += 18; reasons.append(f"RSI sobrecomprado ({rsi:.0f})")
-        elif rsi > 55:
-            score_put  += 8
+        if rsi < 25:   score_call += 28; reasons.append(f"RSI muy sobrevendido ({rsi:.0f})")
+        elif rsi < 35: score_call += 18; reasons.append(f"RSI sobrevendido ({rsi:.0f})")
+        elif rsi < 45: score_call += 8
+        elif rsi > 75: score_put  += 28; reasons.append(f"RSI muy sobrecomprado ({rsi:.0f})")
+        elif rsi > 65: score_put  += 18; reasons.append(f"RSI sobrecomprado ({rsi:.0f})")
+        elif rsi > 55: score_put  += 8
 
         # EMA
-        if ema9 > ema21:
-            score_call += 20; reasons.append("EMA9 sobre EMA21 (alcista)")
-        else:
-            score_put  += 20; reasons.append("EMA9 bajo EMA21 (bajista)")
+        if ema9 > ema21: score_call += 20; reasons.append("EMA9 sobre EMA21 (alcista)")
+        else:            score_put  += 20; reasons.append("EMA9 bajo EMA21 (bajista)")
 
-        if price > ema9:
-            score_call += 10; reasons.append("Precio sobre EMA9")
-        else:
-            score_put  += 10; reasons.append("Precio bajo EMA9")
+        if price > ema9: score_call += 10; reasons.append("Precio sobre EMA9")
+        else:            score_put  += 10; reasons.append("Precio bajo EMA9")
 
         # Bollinger
-        if price < bb_lower:
-            score_call += 22; reasons.append("Precio bajo BB inferior")
-        elif price > bb_upper:
-            score_put  += 22; reasons.append("Precio sobre BB superior")
+        if price < bb_lower:   score_call += 22; reasons.append("Precio bajo BB inferior")
+        elif price > bb_upper: score_put  += 22; reasons.append("Precio sobre BB superior")
         else:
             mid = (bb_upper + bb_lower) / 2
             if price < mid: score_call += 5
             else:           score_put  += 5
 
         # Stochastic
-        if stoch_kv < 20:
-            score_call += 18; reasons.append(f"Stoch sobrevendido ({stoch_kv:.0f})")
-        elif stoch_kv < 35:
-            score_call += 8
-        elif stoch_kv > 80:
-            score_put  += 18; reasons.append(f"Stoch sobrecomprado ({stoch_kv:.0f})")
-        elif stoch_kv > 65:
-            score_put  += 8
+        if stoch_kv < 20:   score_call += 18; reasons.append(f"Stoch sobrevendido ({stoch_kv:.0f})")
+        elif stoch_kv < 35: score_call += 8
+        elif stoch_kv > 80: score_put  += 18; reasons.append(f"Stoch sobrecomprado ({stoch_kv:.0f})")
+        elif stoch_kv > 65: score_put  += 8
 
         # MHI
-        if greens >= 4:
-            score_put  += 12; reasons.append(f"{greens} velas verdes → reversión PUT")
-        elif reds >= 4:
-            score_call += 12; reasons.append(f"{reds} velas rojas → reversión CALL")
-        elif greens == 3:
-            score_put  += 6
-        elif reds == 3:
-            score_call += 6
+        if greens >= 4:   score_put  += 12; reasons.append(f"{greens} velas verdes → reversión PUT")
+        elif reds >= 4:   score_call += 12; reasons.append(f"{reds} velas rojas → reversión CALL")
+        elif greens == 3: score_put  += 6
+        elif reds == 3:   score_call += 6
 
-        if cur_candle == 'ALCISTA' and score_call > score_put:
-            score_call += 5
-        elif cur_candle == 'BAJISTA' and score_put > score_call:
-            score_put  += 5
+        if cur_candle == 'ALCISTA' and score_call > score_put: score_call += 5
+        elif cur_candle == 'BAJISTA' and score_put > score_call: score_put += 5
 
         total = score_call + score_put
         if total == 0:
@@ -170,8 +167,7 @@ def get_signal(ticker: str) -> dict | None:
             signal     = 'PUT'
             confidence = min(95, int(50 + (score_put - score_call) / total * 50))
         else:
-            signal     = 'WAIT'
-            confidence = 50
+            signal, confidence = 'WAIT', 50
 
         if confidence < MIN_CONF:
             signal = 'WAIT'
@@ -185,14 +181,13 @@ def get_signal(ticker: str) -> dict | None:
             'price': price, 'rsi': rsi, 'ema9': ema9, 'ema21': ema21,
             'stoch_k': stoch_kv, 'trend': trend, 'reasons': reasons[:4],
             'greens': greens, 'reds': reds, 'cur_candle': cur_candle,
-            'bb_upper': bb_upper, 'bb_lower': bb_lower,
         }
 
     except Exception as e:
-        logger.error(f"Error analizando {ticker}: {e}")
+        logger.error(f"Error en get_signal({ticker}): {e}")
         return None
 
-# ── FORMATO MENSAJE ───────────────────────────────────────
+# ── FORMATO ───────────────────────────────────────────────
 def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
     name = ASSET_NAMES.get(ticker, ticker)
     sig  = d['signal']
@@ -200,103 +195,130 @@ def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
     now  = datetime.now().strftime('%H:%M:%S')
 
     if sig == 'CALL':
-        sig_line = '🟢 *CALL — COMPRÁ ▲*'
+        sig_line = '🟢 CALL — COMPRA ▲'
         bar = '🟩' * (conf // 10) + '⬜' * (10 - conf // 10)
     elif sig == 'PUT':
-        sig_line = '🔴 *PUT — VENDÉ ▼*'
+        sig_line = '🔴 PUT — VENTA ▼'
         bar = '🟥' * (conf // 10) + '⬜' * (10 - conf // 10)
     else:
-        sig_line = '🟡 *ESPERAR ⏸*'
+        sig_line = '🟡 ESPERAR ⏸'
         bar = '🟨' * max(1, conf // 10) + '⬜' * (10 - max(1, conf // 10))
 
     trend_ico  = '📈' if d['trend'] == 'UP' else '📉' if d['trend'] == 'DOWN' else '➡️'
     candle_ico = '🟢' if d['cur_candle'] == 'ALCISTA' else '🔴'
-    reasons_text = '\n'.join([f'  ✦ {r}' for r in d['reasons']]) or '  ✦ Sin señales fuertes'
-    header = '🤖 *SEÑAL AUTOMÁTICA*' if auto else '📊 *SEÑAL SOLICITADA*'
+    reasons_text = '\n'.join([f'  • {r}' for r in d['reasons']]) or '  • Sin señal fuerte'
+    header = '🤖 SEÑAL AUTO' if auto else '📊 SEÑAL'
 
     return (
-        f"{header} — `{now}`\n"
+        f"{header} | {now}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 *{name}*\n"
+        f"💱 {name}\n"
         f"{sig_line}\n\n"
-        f"📊 Confianza: *{conf}%*\n"
-        f"`{bar}`\n\n"
-        f"📐 *Indicadores:*\n"
-        f"  RSI: `{d['rsi']:.1f}` | Stoch: `{d['stoch_k']:.1f}`\n"
-        f"  {trend_ico} Tendencia: `{d['trend']}`\n"
-        f"  {candle_ico} Vela actual: `{d['cur_candle']}`\n"
-        f"  Precio: `{d['price']:.5f}`\n\n"
-        f"✅ *Razones:*\n{reasons_text}\n\n"
-        f"⏱ _Recomendado: velas 1M · exp. 1\\-2M_\n"
-        f"⚠️ _Señal orientativa\\. Gestioná el riesgo\\._"
+        f"Confianza: {conf}%\n"
+        f"{bar}\n\n"
+        f"RSI: {d['rsi']:.1f} | Stoch: {d['stoch_k']:.1f}\n"
+        f"{trend_ico} Tendencia: {d['trend']}\n"
+        f"{candle_ico} Vela: {d['cur_candle']}\n"
+        f"Precio: {d['price']:.5f}\n\n"
+        f"Razones:\n{reasons_text}\n\n"
+        f"⏱ Recomendado: exp. 1-2 min\n"
+        f"⚠️ Señal orientativa. Gestioná el riesgo."
     )
 
-# ── ENVÍO AUTO ────────────────────────────────────────────
-async def send_signals(bot: Bot, auto: bool = False):
+# ── ENVÍO ─────────────────────────────────────────────────
+async def send_signals(bot, auto: bool = False):
     if not CHAT_ID:
         return
     found = 0
-    header_sent = False
     for ticker in ASSETS:
-        data = get_signal(ticker)
+        try:
+            # Ejecutar en thread para no bloquear
+            data = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, get_signal, ticker),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout analizando {ticker}")
+            continue
+        except Exception as e:
+            logger.error(f"Error en {ticker}: {e}")
+            continue
+
         if not data:
             continue
         if auto and data['signal'] == 'WAIT':
             continue
-        if auto and not header_sent:
+
+        try:
             await bot.send_message(
                 chat_id=CHAT_ID,
-                text=f"🔔 *ESCANEO AUTOMÁTICO* — {datetime.now().strftime('%H:%M')}",
-                parse_mode='Markdown'
+                text=format_msg(ticker, data, auto)
             )
-            header_sent = True
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=format_msg(ticker, data, auto),
-            parse_mode='MarkdownV2'
-        )
-        found += 1
-        await asyncio.sleep(0.6)
+            found += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Error enviando mensaje: {e}")
 
     if auto and found == 0:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"🟡 *{datetime.now().strftime('%H:%M')}* — Sin señales claras\\. Esperando\\.",
-            parse_mode='MarkdownV2'
-        )
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"🟡 {datetime.now().strftime('%H:%M')} — Sin señales claras. Esperando mejor oportunidad."
+            )
+        except Exception as e:
+            logger.error(f"Error enviando mensaje: {e}")
 
 # ── HANDLERS ──────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await update.message.reply_text(
-        f"⚡ *TradeScan Bot* — Pocket Option\n"
+        f"⚡ TradeScan Bot — Pocket Option\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Tu Chat ID: `{cid}`\n\n"
-        f"📋 *Comandos:*\n"
+        f"Tu Chat ID: {cid}\n\n"
+        f"Comandos:\n"
         f"/signal — Señal de todos los pares\n"
         f"/eurusd — Solo EUR/USD\n"
         f"/gbpusd — Solo GBP/USD\n"
         f"/usdjpy — Solo USD/JPY\n"
         f"/audusd — Solo AUD/USD\n"
         f"/status — Estado del bot\n\n"
-        f"🤖 Señales automáticas cada *{INTERVAL_MIN} min*",
-        parse_mode='Markdown'
+        f"Señales automáticas cada {INTERVAL_MIN} min"
     )
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Analizando mercado...")
+    msg = await update.message.reply_text("🔍 Analizando mercado... (puede tardar 20-30 segundos)")
     await send_signals(ctx.bot, auto=False)
+    try:
+        await msg.delete()
+    except:
+        pass
 
 async def _pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ticker: str):
     name = ASSET_NAMES.get(ticker, ticker)
-    await update.message.reply_text(f"🔍 Analizando {name}...")
-    data = get_signal(ticker)
-    if data:
-        await update.message.reply_text(
-            format_msg(ticker, data, False), parse_mode='MarkdownV2')
-    else:
-        await update.message.reply_text(
-            f"⚠️ Sin datos para {name}. Puede ser horario de mercado cerrado.")
+    msg = await update.message.reply_text(f"🔍 Analizando {name}...")
+    try:
+        data = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, get_signal, ticker),
+            timeout=30
+        )
+        if data:
+            await update.message.reply_text(format_msg(ticker, data, False))
+        else:
+            await update.message.reply_text(
+                f"⚠️ Sin datos para {name}.\n"
+                f"Posibles causas:\n"
+                f"• Mercado cerrado (fin de semana)\n"
+                f"• Yahoo Finance sin datos temporalmente\n"
+                f"Intentá en unos minutos."
+            )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏱️ Tiempo de espera agotado para {name}. Intentá de nuevo.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+    try:
+        await msg.delete()
+    except:
+        pass
 
 async def cmd_eurusd(u, c): await _pair(u, c, 'EURUSD=X')
 async def cmd_gbpusd(u, c): await _pair(u, c, 'GBPUSD=X')
@@ -306,12 +328,11 @@ async def cmd_audusd(u, c): await _pair(u, c, 'AUDUSD=X')
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pairs = ', '.join([ASSET_NAMES.get(a, a) for a in ASSETS])
     await update.message.reply_text(
-        f"✅ *Bot activo*\n"
-        f"🕐 Hora: `{datetime.now().strftime('%H:%M:%S')}`\n"
-        f"⏱ Intervalo: `{INTERVAL_MIN} minutos`\n"
-        f"📊 Pares: `{pairs}`\n"
-        f"🎯 Confianza mínima: `{MIN_CONF}%`",
-        parse_mode='Markdown'
+        f"✅ Bot activo\n"
+        f"Hora: {datetime.now().strftime('%H:%M:%S')}\n"
+        f"Intervalo: {INTERVAL_MIN} minutos\n"
+        f"Pares: {pairs}\n"
+        f"Confianza mínima: {MIN_CONF}%"
     )
 
 # ── MAIN ──────────────────────────────────────────────────
