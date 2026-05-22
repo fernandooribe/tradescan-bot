@@ -1,13 +1,14 @@
 """
 TradeScan Bot — Señales automáticas para Pocket Option
+Fuente de datos: Alpha Vantage (gratis, estable, tiempo real)
 """
 import os
 import asyncio
 import logging
 import numpy as np
-from datetime import datetime
-import yfinance as yf
+import requests
 import pandas as pd
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,22 +16,78 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── CONFIG ────────────────────────────────────────────────
 TOKEN        = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID      = os.getenv('TELEGRAM_CHAT_ID', '')
+AV_KEY       = os.getenv('ALPHAVANTAGE_KEY', '')
 INTERVAL_MIN = int(os.getenv('SIGNAL_INTERVAL', '5'))
 MIN_CONF     = int(os.getenv('MIN_CONFIDENCE', '65'))
-ASSETS_RAW   = os.getenv('ASSETS', 'EURUSD=X,GBPUSD=X,USDJPY=X,AUDUSD=X')
+ASSETS_RAW   = os.getenv('ASSETS', 'EURUSD,GBPUSD,USDJPY,AUDUSD')
 ASSETS       = [a.strip() for a in ASSETS_RAW.split(',')]
 
 ASSET_NAMES = {
-    'EURUSD=X': 'EUR/USD-OTC',
-    'GBPUSD=X': 'GBP/USD-OTC',
-    'USDJPY=X': 'USD/JPY-OTC',
-    'AUDUSD=X': 'AUD/USD-OTC',
-    'USDCAD=X': 'USD/CAD-OTC',
-    'EURGBP=X': 'EUR/GBP-OTC',
-    'EURJPY=X': 'EUR/JPY-OTC',
+    'EURUSD': 'EUR/USD-OTC',
+    'GBPUSD': 'GBP/USD-OTC',
+    'USDJPY': 'USD/JPY-OTC',
+    'AUDUSD': 'AUD/USD-OTC',
+    'USDCAD': 'USD/CAD-OTC',
+    'EURGBP': 'EUR/GBP-OTC',
+    'EURJPY': 'EUR/JPY-OTC',
 }
+
+# ── ALPHA VANTAGE ─────────────────────────────────────────
+def fetch_forex(pair: str) -> pd.DataFrame | None:
+    """Descarga velas de 1 minuto desde Alpha Vantage"""
+    from_sym = pair[:3]
+    to_sym   = pair[3:]
+    url = (
+        f"https://www.alphavantage.co/query"
+        f"?function=FX_INTRADAY"
+        f"&from_symbol={from_sym}"
+        f"&to_symbol={to_sym}"
+        f"&interval=1min"
+        f"&outputsize=compact"
+        f"&apikey={AV_KEY}"
+    )
+    try:
+        resp = requests.get(url, timeout=20)
+        data = resp.json()
+
+        if 'Error Message' in data:
+            logger.error(f"AV error: {data['Error Message']}")
+            return None
+        if 'Note' in data:
+            logger.warning(f"AV límite de velocidad: {data['Note']}")
+            return None
+        if 'Information' in data:
+            logger.warning(f"AV info: {data['Information']}")
+            return None
+
+        key = 'Time Series FX (1min)'
+        if key not in data:
+            logger.warning(f"AV sin datos para {pair}: {list(data.keys())}")
+            return None
+
+        ts = data[key]
+        rows = []
+        for dt_str, vals in ts.items():
+            rows.append({
+                'datetime': pd.to_datetime(dt_str),
+                'Open':  float(vals['1. open']),
+                'High':  float(vals['2. high']),
+                'Low':   float(vals['3. low']),
+                'Close': float(vals['4. close']),
+            })
+
+        df = pd.DataFrame(rows).sort_values('datetime').reset_index(drop=True)
+        return df
+
+    except requests.Timeout:
+        logger.warning(f"Timeout descargando {pair}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetch_forex({pair}): {e}")
+        return None
 
 # ── INDICADORES ───────────────────────────────────────────
 def calc_rsi(series, period=14):
@@ -54,47 +111,18 @@ def calc_stoch(high, low, close, k=14, d=3):
     stoch_k = 100 * (close - lowest) / (highest - lowest).replace(0, np.nan)
     return stoch_k, stoch_k.rolling(d).mean()
 
-# ── OBTENER DATOS (con timeout) ───────────────────────────
-def fetch_data(ticker: str):
-    """Descarga datos con timeout de 15 segundos"""
-    try:
-        df = yf.download(
-            ticker, period='1d', interval='1m',
-            progress=False, auto_adjust=True,
-            timeout=15
-        )
-        if df is None or df.empty:
-            # Intentar con period='2d' como fallback
-            df = yf.download(
-                ticker, period='2d', interval='1m',
-                progress=False, auto_adjust=True,
-                timeout=15
-            )
-        return df
-    except Exception as e:
-        logger.warning(f"Error descargando {ticker}: {e}")
-        return None
-
 # ── SEÑAL ─────────────────────────────────────────────────
-def get_signal(ticker: str) -> dict | None:
+def get_signal(pair: str) -> dict | None:
     try:
-        df = fetch_data(ticker)
-
-        if df is None or df.empty or len(df) < 20:
-            logger.warning(f"{ticker}: datos insuficientes ({len(df) if df is not None else 0} velas)")
+        df = fetch_forex(pair)
+        if df is None or len(df) < 20:
+            logger.warning(f"{pair}: datos insuficientes")
             return None
 
-        # Aplanar multi-index
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        close = df['Close'].astype(float).dropna()
-        high  = df['High'].astype(float).dropna()
-        low   = df['Low'].astype(float).dropna()
-        open_ = df['Open'].astype(float).dropna()
-
-        if len(close) < 20:
-            return None
+        close = df['Close'].astype(float)
+        high  = df['High'].astype(float)
+        low   = df['Low'].astype(float)
+        open_ = df['Open'].astype(float)
 
         rsi      = float(calc_rsi(close, 14).iloc[-1])
         ema9     = float(calc_ema(close, 9).iloc[-1])
@@ -103,17 +131,16 @@ def get_signal(ticker: str) -> dict | None:
         bb_upper = float(bb_up.iloc[-1])
         bb_lower = float(bb_lo.iloc[-1])
         stoch_k, _ = calc_stoch(high, low, close)
-        stoch_kv = float(stoch_k.iloc[-1])
-        price    = float(close.iloc[-1])
+        stoch_kv   = float(stoch_k.iloc[-1])
+        price      = float(close.iloc[-1])
 
-        # Verificar NaN
         if any(np.isnan(v) for v in [rsi, ema9, ema21, stoch_kv, price]):
             return None
 
         last5  = df.tail(5)
-        greens = sum(1 for _, r in last5.iterrows() if float(r['Close']) > float(r['Open']))
+        greens = sum(1 for _, r in last5.iterrows() if r['Close'] > r['Open'])
         reds   = 5 - greens
-        cur_candle = 'ALCISTA' if float(close.iloc[-1]) > float(open_.iloc[-1]) else 'BAJISTA'
+        cur_candle = 'ALCISTA' if close.iloc[-1] > open_.iloc[-1] else 'BAJISTA'
 
         score_call, score_put = 0, 0
         reasons = []
@@ -184,12 +211,12 @@ def get_signal(ticker: str) -> dict | None:
         }
 
     except Exception as e:
-        logger.error(f"Error en get_signal({ticker}): {e}")
+        logger.error(f"Error get_signal({pair}): {e}")
         return None
 
 # ── FORMATO ───────────────────────────────────────────────
-def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
-    name = ASSET_NAMES.get(ticker, ticker)
+def format_msg(pair: str, d: dict, auto: bool = False) -> str:
+    name = ASSET_NAMES.get(pair, pair)
     sig  = d['signal']
     conf = d['confidence']
     now  = datetime.now().strftime('%H:%M:%S')
@@ -206,8 +233,8 @@ def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
 
     trend_ico  = '📈' if d['trend'] == 'UP' else '📉' if d['trend'] == 'DOWN' else '➡️'
     candle_ico = '🟢' if d['cur_candle'] == 'ALCISTA' else '🔴'
-    reasons_text = '\n'.join([f'  • {r}' for r in d['reasons']]) or '  • Sin señal fuerte'
-    header = '🤖 SEÑAL AUTO' if auto else '📊 SEÑAL'
+    reasons_tx = '\n'.join([f'  • {r}' for r in d['reasons']]) or '  • Sin señal dominante'
+    header     = '🤖 SEÑAL AUTO' if auto else '📊 SEÑAL'
 
     return (
         f"{header} | {now}\n"
@@ -218,9 +245,9 @@ def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
         f"{bar}\n\n"
         f"RSI: {d['rsi']:.1f} | Stoch: {d['stoch_k']:.1f}\n"
         f"{trend_ico} Tendencia: {d['trend']}\n"
-        f"{candle_ico} Vela: {d['cur_candle']}\n"
+        f"{candle_ico} Vela actual: {d['cur_candle']}\n"
         f"Precio: {d['price']:.5f}\n\n"
-        f"Razones:\n{reasons_text}\n\n"
+        f"Razones:\n{reasons_tx}\n\n"
         f"⏱ Recomendado: exp. 1-2 min\n"
         f"⚠️ Señal orientativa. Gestioná el riesgo."
     )
@@ -229,19 +256,25 @@ def format_msg(ticker: str, d: dict, auto: bool = False) -> str:
 async def send_signals(bot, auto: bool = False):
     if not CHAT_ID:
         return
+    if not AV_KEY:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="⚠️ Falta configurar ALPHAVANTAGE_KEY en Railway."
+        )
+        return
+
     found = 0
-    for ticker in ASSETS:
+    for pair in ASSETS:
         try:
-            # Ejecutar en thread para no bloquear
             data = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, get_signal, ticker),
-                timeout=30
+                asyncio.get_event_loop().run_in_executor(None, get_signal, pair),
+                timeout=25
             )
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout analizando {ticker}")
+            logger.warning(f"Timeout en {pair}")
             continue
         except Exception as e:
-            logger.error(f"Error en {ticker}: {e}")
+            logger.error(f"Error {pair}: {e}")
             continue
 
         if not data:
@@ -250,23 +283,17 @@ async def send_signals(bot, auto: bool = False):
             continue
 
         try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=format_msg(ticker, data, auto)
-            )
+            await bot.send_message(chat_id=CHAT_ID, text=format_msg(pair, data, auto))
             found += 1
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.5)  # respetar límite AV
         except Exception as e:
-            logger.error(f"Error enviando mensaje: {e}")
+            logger.error(f"Error enviando {pair}: {e}")
 
     if auto and found == 0:
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🟡 {datetime.now().strftime('%H:%M')} — Sin señales claras. Esperando mejor oportunidad."
-            )
-        except Exception as e:
-            logger.error(f"Error enviando mensaje: {e}")
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"🟡 {datetime.now().strftime('%H:%M')} — Sin señales claras. Esperando mejor momento."
+        )
 
 # ── HANDLERS ──────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -286,33 +313,28 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Analizando mercado... (puede tardar 20-30 segundos)")
+    await update.message.reply_text("🔍 Analizando mercado... (20-30 segundos)")
     await send_signals(ctx.bot, auto=False)
-    try:
-        await msg.delete()
-    except:
-        pass
 
-async def _pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ticker: str):
-    name = ASSET_NAMES.get(ticker, ticker)
-    msg = await update.message.reply_text(f"🔍 Analizando {name}...")
+async def _pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pair: str):
+    name = ASSET_NAMES.get(pair, pair)
+    msg  = await update.message.reply_text(f"🔍 Analizando {name}...")
     try:
         data = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, get_signal, ticker),
-            timeout=30
+            asyncio.get_event_loop().run_in_executor(None, get_signal, pair),
+            timeout=25
         )
         if data:
-            await update.message.reply_text(format_msg(ticker, data, False))
+            await update.message.reply_text(format_msg(pair, data, False))
         else:
             await update.message.reply_text(
                 f"⚠️ Sin datos para {name}.\n"
-                f"Posibles causas:\n"
-                f"• Mercado cerrado (fin de semana)\n"
-                f"• Yahoo Finance sin datos temporalmente\n"
-                f"Intentá en unos minutos."
+                f"• Verificá que ALPHAVANTAGE_KEY esté en Railway\n"
+                f"• O el mercado puede estar cerrado (fin de semana)\n"
+                f"• Intentá en unos minutos"
             )
     except asyncio.TimeoutError:
-        await update.message.reply_text(f"⏱️ Tiempo de espera agotado para {name}. Intentá de nuevo.")
+        await update.message.reply_text("⏱️ Tiempo agotado. Intentá de nuevo.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
     try:
@@ -320,17 +342,20 @@ async def _pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ticker: str):
     except:
         pass
 
-async def cmd_eurusd(u, c): await _pair(u, c, 'EURUSD=X')
-async def cmd_gbpusd(u, c): await _pair(u, c, 'GBPUSD=X')
-async def cmd_usdjpy(u, c): await _pair(u, c, 'USDJPY=X')
-async def cmd_audusd(u, c): await _pair(u, c, 'AUDUSD=X')
+async def cmd_eurusd(u, c): await _pair(u, c, 'EURUSD')
+async def cmd_gbpusd(u, c): await _pair(u, c, 'GBPUSD')
+async def cmd_usdjpy(u, c): await _pair(u, c, 'USDJPY')
+async def cmd_audusd(u, c): await _pair(u, c, 'AUDUSD')
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pairs = ', '.join([ASSET_NAMES.get(a, a) for a in ASSETS])
+    pairs    = ', '.join([ASSET_NAMES.get(a, a) for a in ASSETS])
+    key_ok   = '✅' if AV_KEY else '❌ Falta ALPHAVANTAGE_KEY'
     await update.message.reply_text(
         f"✅ Bot activo\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
         f"Hora: {datetime.now().strftime('%H:%M:%S')}\n"
-        f"Intervalo: {INTERVAL_MIN} minutos\n"
+        f"Alpha Vantage: {key_ok}\n"
+        f"Intervalo: {INTERVAL_MIN} min\n"
         f"Pares: {pairs}\n"
         f"Confianza mínima: {MIN_CONF}%"
     )
@@ -356,7 +381,7 @@ def main():
     )
     scheduler.start()
 
-    logger.info(f"✅ Bot iniciado — señales cada {INTERVAL_MIN} minutos")
+    logger.info(f"✅ Bot iniciado — Alpha Vantage — señales cada {INTERVAL_MIN} min")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
